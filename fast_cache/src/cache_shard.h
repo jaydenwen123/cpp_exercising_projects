@@ -117,7 +117,7 @@ inline bool CacheShard<K, V>::set(CacheItem<K, V> &item) {
   updateIndex(item, index);
   return true;
 }
-writeIntoData
+
 template <typename K, typename V>
 inline void CacheShard<K, V>::updateIndex(CacheItem<K, V> &item,
                                           CacheIndex &index) {
