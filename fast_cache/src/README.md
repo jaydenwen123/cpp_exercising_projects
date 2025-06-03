@@ -21,7 +21,14 @@
 4. Poco：完整的LRU实现，含过期机制
 5. LruCache：最小化实现的线程安全LRU
 ## 编译安装
-
+```shell
+ cd fast_cache
+ mkdir build
+ cd build
+ # 生成clangd需要的构建索引的json文件，compile_commands.json
+ cmake  -DCMAKE_EXPORT_COMPILE_COMMANDS=1 ..
+ make
+```
 ## 整体设计思路
 
 ### 1. 整体架构

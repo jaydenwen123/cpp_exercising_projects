@@ -5,6 +5,12 @@ project(fast_cache VERSION 1.0.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# 设置 C 编译器优化选项为 -O2
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2")
+# 设置 C++ 编译器优化选项为 -O2
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")
+
+
 # 查找依赖库
 find_package(ZLIB REQUIRED)
 # find_package(spdlog REQUIRED)  # 如果已安装spdlog
@@ -22,9 +28,14 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/google/googletest.git
   GIT_TAG release-1.12.1
 )
+FetchContent_Declare(
+  benchmark
+  GIT_REPOSITORY https://github.com/google/benchmark.git
+  GIT_TAG v1.8.3
+)
 FetchContent_MakeAvailable(spdlog)
 FetchContent_MakeAvailable(googletest)
-
+FetchContent_MakeAvailable(benchmark)
 
 # 添加主库
 add_library(fast_cache INTERFACE)
@@ -57,6 +68,10 @@ add_executable(cache_shard_test
   test/fast_cache/cache_shard_test.cpp
 )
 
+add_executable(fast_cache_benchmark
+  benchmark/fast_cache_benchmark.cpp
+)
+
 target_compile_definitions(fast_cache_example
   PRIVATE USE_SPDLOG
 )
@@ -84,6 +99,14 @@ target_link_libraries(cache_shard_test
     fast_cache
     gtest_main
 )
+
+target_link_libraries(fast_cache_benchmark
+  PRIVATE
+    fast_cache
+    benchmark::benchmark
+    benchmark::benchmark_main
+)
+
 # 安装规则
 install(TARGETS fast_cache
   ARCHIVE DESTINATION lib

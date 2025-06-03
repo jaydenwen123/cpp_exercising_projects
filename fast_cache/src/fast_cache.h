@@ -11,7 +11,6 @@ static const int64_t capacityDefaultSize=1024*1024*1024;
 
 template <typename K, typename V> class FastCache {
 public:
-  FastCache();
   FastCache(const int shard_num=kShardNum,const int64_t capacity_size=capacityDefaultSize);
   ~FastCache() {}
 
@@ -23,24 +22,20 @@ public:
 
 private:
   std::vector<std::unique_ptr<CacheShard<K, V>>> _cache_shards;
-  std::vector<std::shared_mutex> _shard_mutexs_;
+  std::vector<std::unique_ptr<std::shared_mutex>> _shard_mutexs;
   int _shard_num;
 };
-
-template <typename K, typename V>
-inline FastCache<K, V>::FastCache() : FastCache(kShardNum) {}
 
 template <typename K, typename V>
 inline FastCache<K, V>::FastCache(const int shard_num,const int64_t capacity_size) {
   _shard_num = shard_num;
   _cache_shards.reserve(shard_num);
-  _shard_mutexs_.clear();
-  _shard_mutexs_.reserve(shard_num);
+  _shard_mutexs.reserve(shard_num);
   int64_t shard_size=capacity_size/shard_num;
   for (int i = 0; i < shard_num; i++) {
     // 这里根据指定的容量大小初始化每个cache_shards的大小
     _cache_shards.emplace_back(std::make_unique<CacheShard<K, V>>(shard_size));
-    _shard_mutexs_.emplace_back(std::shared_mutex());
+    _shard_mutexs.emplace_back(std::make_unique<std::shared_mutex>());
   }
 }
 
@@ -48,7 +43,7 @@ template <typename K, typename V>
 inline bool FastCache<K, V>::set(const K &key, const V &val) {
   int shard_index = get_shard_index(key);
   // 第三步再调用每个_cache_shards的set方法
-  std::unique_lock<std::shared_mutex> lock(_shard_mutexs_[shard_index]);
+  std::unique_lock<std::shared_mutex> lock(*_shard_mutexs[shard_index]);
   return _cache_shards[shard_index]->set(key, val);
 }
 
@@ -66,21 +61,21 @@ template <typename K, typename V>
 inline bool FastCache<K, V>::set(const K &key, const V &val,
                                  int64_t expire_time) {
   int shard_index = get_shard_index(key);
-  std::unique_lock<std::shared_mutex> lock(_shard_mutexs_[shard_index]);
+  std::unique_lock<std::shared_mutex> lock(*_shard_mutexs[shard_index]);
   return _cache_shards[shard_index]->set(key, val, expire_time);
 }
 
 template <typename K, typename V>
 inline bool FastCache<K, V>::get(const K &key, V &val) {
   int shard_index = get_shard_index(key);
-  std::shared_lock<std::shared_mutex> lock(_shard_mutexs_[shard_index]);
+  std::shared_lock<std::shared_mutex> lock(*_shard_mutexs[shard_index]);
   return _cache_shards[shard_index]->get(key, val);
 }
 
 template <typename K, typename V>
 inline bool FastCache<K, V>::del(const K &key) {
   int shard_index = get_shard_index(key);
-  std::unique_lock<std::shared_mutex> lock(_shard_mutexs_[shard_index]);
+  std::unique_lock<std::shared_mutex> lock(*_shard_mutexs[shard_index]);
   return _cache_shards[shard_index]->del(key);
 }
 
