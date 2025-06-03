@@ -10,6 +10,8 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2")
 # 设置 C++ 编译器优化选项为 -O2
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")
 
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
 
 # 查找依赖库
 find_package(ZLIB REQUIRED)

@@ -8,10 +8,22 @@
 #include <zlib.h>
 namespace fast_cache {
 
+enum DataOpType {
+  SET,
+  GET,
+  DEL,
+  // todo...
+};
 // 存储索引信息
-struct CacheIndex {
+struct ItemIndex {
   int64_t start;
   int64_t length;
+  int64_t expire_time;
+};
+
+template <typename K> struct IndexEntry {
+  ItemIndex index;
+  typename std::list<std::pair<K, ItemIndex>>::iterator lru_iter = {};
 };
 
 enum DataEvitePolicy {
@@ -30,12 +42,13 @@ public:
   bool set(const K &key, const V &val);
   bool set(const K &key, const V &val, int64_t expire_time);
   bool set(CacheItem<K, V> &item);
-  void updateIndex(CacheItem<K, V> &item, CacheIndex &index);
-  void updateEvitInfo(K &key, CacheIndex &index);
+  void updateIndex(CacheItem<K, V> &item, IndexEntry<K> &index_entry);
+  void updateEvitInfo(const K &key, IndexEntry<K> &index_entry,
+                      DataOpType op_type = SET);
   // 获取数据
   bool get(const K &key, V &val);
-  bool getIndex(const K &key, CacheIndex &index);
-  bool itemIsValid(CacheItem<K, V> &item);
+  bool getIndex(const K &key, IndexEntry<K> &index_entry);
+  bool itemIsExpired(int64_t expire_time);
   // 删除数据
   bool del(const K &key);
 
@@ -53,7 +66,7 @@ private:
 
   int64_t cal_check_sum(std::vector<uint8_t> &data, int offset, int length);
 
-  std::unordered_map<K, CacheIndex> indexs_;
+  std::unordered_map<K, IndexEntry<K>> indexs_;
   // todo
   // 这里应该采用一个数据容器，比如std::array<uint8_t>。后续应该替换为一个循环队列。
   std::vector<uint8_t> data_;
@@ -63,7 +76,7 @@ private:
   // 数据淘汰策略
   DataEvitePolicy evite_policy_;
   // 支持LRU
-  std::list<std::pair<K, CacheIndex>> lru_list_;
+  std::list<std::pair<K, ItemIndex>> lru_list_;
   // todo 支持LFU
 
   // todo 支持数据清理/延迟删除
@@ -75,7 +88,7 @@ private:
   // 无用数据(数据过期or删除)占用空间的比例，当大于一定比例时触发数据清理逻辑
   int64_t data_invalid_size_;
   // 无效数据的比例阈值
-  float data_invalid_rate_threahold_;
+  float data_evite_invalid_rate_threahold_;
   // 数据定时整理的时间间隔
   int64_t data_evite_interval_;
   // todo 支持数据持久化
@@ -109,27 +122,40 @@ inline bool CacheShard<K, V>::set(CacheItem<K, V> &item) {
   serialize(item, item_data);
   // 必须先保存，因为下面会把item_data的数据移动到data_中，所以直接取size()会是0
   // 写成功后再更新索引indexs_
-  CacheIndex index;
-  index.start = data_.size();
-  index.length = item_data.size();
+  IndexEntry<K> index_entry;
+  index_entry.index.start = data_.size();
+  index_entry.index.length = item_data.size();
+  index_entry.index.expire_time = item.expire_time;
   // 先写data_
-  (item_data);
-  updateIndex(item, index);
+  if (!writeIntoData(item_data)) {
+    spdlog::error("writeIntoData failed");
+    return false;
+  }
+  updateIndex(item, index_entry);
   return true;
 }
 
 template <typename K, typename V>
 inline void CacheShard<K, V>::updateIndex(CacheItem<K, V> &item,
-                                          CacheIndex &index) {
+                                          IndexEntry<K> &index_entry) {
   // 记录索引
-  updateEvitInfo(item.key, index);
-  indexs_[item.key] = std::move(index);
+  updateEvitInfo(item.key, index_entry, SET);
+  indexs_[item.key] = std::move(index_entry);
 }
 
 template <typename K, typename V>
-inline void CacheShard<K, V>::updateEvitInfo(K &key, CacheIndex &index) {
+inline void CacheShard<K, V>::updateEvitInfo(const K &key,
+                                             IndexEntry<K> &index_entry,
+                                             DataOpType op_type) {
   if (evite_policy_ == LRU) {
-    lru_list_.push_front(std::make_pair(key, index));
+    // 存在的话先删除，然后再移动到头部
+    if (indexs_.count(key) > 0 && index_entry.lru_iter != lru_list_.end()) {
+      lru_list_.erase(index_entry.lru_iter);
+    }
+    if (op_type != DEL) {
+      lru_list_.push_front(std::make_pair(key, index_entry.index));
+      index_entry.lru_iter = lru_list_.begin();
+    }
   } else if (evite_policy_ == LFU) {
     // todo lfu
   } else {
@@ -139,10 +165,17 @@ inline void CacheShard<K, V>::updateEvitInfo(K &key, CacheIndex &index) {
 
 template <typename K, typename V>
 inline bool CacheShard<K, V>::get(const K &key, V &val) {
-  CacheIndex index;
-  bool suc = getIndex(key, index);
+  IndexEntry<K> index_entry;
+  bool suc = getIndex(key, index_entry);
   if (!suc)
     return false;
+  auto &index = index_entry.index;
+  if (itemIsExpired(index.expire_time)) {
+    spdlog::error("item is expired");
+    // 更新无用数据的大小
+    data_invalid_size_ += index.length;
+    return false;
+  }
   //  然后再根据索引读取序列化的数据
   std::vector<uint8_t> data;
   data.reserve(index.length);
@@ -159,43 +192,52 @@ inline bool CacheShard<K, V>::get(const K &key, V &val) {
     spdlog::error("deserialize key:{} failed", key);
     return false;
   }
-  if (!itemIsValid(item)) {
+
+  if (item.expire_time != index.expire_time) {
+    spdlog::error("item expire_time is not equal");
+    data_invalid_size_ += index.length;
+    return false;
+  }
+
+  if (itemIsExpired(item.expire_time)) {
     spdlog::error("item is expired");
     // 更新无用数据的大小
     data_invalid_size_ += index.length;
     return false;
   }
+
   val = item.val;
   //  最后返回数据
   return true;
 }
 template <typename K, typename V>
-inline bool CacheShard<K, V>::getIndex(const K &key, CacheIndex &index) {
+inline bool CacheShard<K, V>::getIndex(const K &key,
+                                       IndexEntry<K> &entry_index) {
   //  先获取索引数据
   auto iter = indexs_.find(key);
   if (iter == indexs_.end()) {
     spdlog::error("key:{} is not found", key);
     return false;
   }
-  index = iter->second;
-  updateEvitInfo(key, index);
+  entry_index = iter->second;
+  updateEvitInfo(key, entry_index, GET);
   return true;
 }
 template <typename K, typename V>
-inline bool CacheShard<K, V>::itemIsValid(CacheItem<K, V> &item) {
-  return item.expire_time == dataNoExpire || item.expire_time > time(NULL);
+inline bool CacheShard<K, V>::itemIsExpired(int64_t expire_time) {
+  return expire_time != dataNoExpire && expire_time < time(NULL);
 }
 template <typename K, typename V>
 inline bool CacheShard<K, V>::del(const K &key) {
-  // 从索引数据删除,1表示删除成功，0表示key不存在
   auto iter = indexs_.find(key);
   if (iter == indexs_.end()) {
     spdlog::error("key:{} is not found", key);
     return false;
   }
-  auto &index = iter->second;
+  auto &entry_index = iter->second;
   indexs_.erase(iter);
-  data_invalid_size_ += index.length;
+  updateEvitInfo(key, entry_index, DEL);
+  data_invalid_size_ += entry_index.index.length;
   // 异常的数据 后台定时任务进行处理删除合并，清理空间
   return true;
 }
@@ -287,15 +329,18 @@ inline bool CacheShard<K, V>::deserialize(std::vector<uint8_t> &data,
   if (Serializer<int64_t>::deserialize(data, expire_time, offset)) {
     offset += sizeof(int64_t);
   }
+
   int64_t new_check_sum = cal_check_sum(data, 0, offset);
   if (Serializer<int64_t>::deserialize(data, check_sum, offset)) {
     offset += sizeof(int64_t);
   }
-  // 最后校验校验和
+  // 校验校验和
   if (check_sum != new_check_sum) {
     spdlog::error("check_sum is not equal");
     return false;
   }
+
+  // 最后赋值给item
   item.key = key;
   item.val = val;
   item.expire_time = expire_time;
