@@ -12,6 +12,7 @@ public:
                           int64_t offset, int64_t length = 0) {
     static_assert(std::is_trivially_copyable<T>::value,
                   "Type must be trivially copyable for default serialization");
+    return true;
   }
 };
 

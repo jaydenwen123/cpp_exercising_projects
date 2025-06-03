@@ -1,17 +1,21 @@
 #include "cache_shard.h"
+#include "spdlog/sinks/basic_file_sink.h"
+#include <iostream>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
+#include "logger.h"
 namespace fast_cache {
 
 static const int kShardNum = 256;
 
 // 1G大小
-static const int64_t capacityDefaultSize=1024*1024*1024;
+static const int64_t capacityDefaultSize = 1024 * 1024 * 1024;
 
 template <typename K, typename V> class FastCache {
 public:
-  FastCache(const int shard_num=kShardNum,const int64_t capacity_size=capacityDefaultSize);
+  FastCache(const int shard_num = kShardNum,
+            const int64_t capacity_size = capacityDefaultSize);
   ~FastCache() {}
 
   bool set(const K &key, const V &val);
@@ -27,11 +31,12 @@ private:
 };
 
 template <typename K, typename V>
-inline FastCache<K, V>::FastCache(const int shard_num,const int64_t capacity_size) {
+inline FastCache<K, V>::FastCache(const int shard_num,
+                                  const int64_t capacity_size) {
   _shard_num = shard_num;
   _cache_shards.reserve(shard_num);
   _shard_mutexs.reserve(shard_num);
-  int64_t shard_size=capacity_size/shard_num;
+  int64_t shard_size = capacity_size / shard_num;
   for (int i = 0; i < shard_num; i++) {
     // 这里根据指定的容量大小初始化每个cache_shards的大小
     _cache_shards.emplace_back(std::make_unique<CacheShard<K, V>>(shard_size));

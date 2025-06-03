@@ -1,6 +1,7 @@
 #include "cache_item.h"
 #include "serializer.h"
 #include <iterator>
+#include <list>
 #include <spdlog/spdlog.h>
 #include <unordered_map>
 #include <vector>
@@ -13,6 +14,12 @@ struct CacheIndex {
   int64_t length;
 };
 
+enum DataEvitePolicy {
+  LRU,
+  LFU,
+  RANDOM
+  // todo ...
+};
 template <typename K, typename V> class CacheShard {
 public:
   CacheShard(int64_t size) { init(size); }
@@ -23,9 +30,12 @@ public:
   bool set(const K &key, const V &val);
   bool set(const K &key, const V &val, int64_t expire_time);
   bool set(CacheItem<K, V> &item);
+  void updateIndex(CacheItem<K, V> &item, CacheIndex &index);
+  void updateEvitInfo(K &key, CacheIndex &index);
   // 获取数据
   bool get(const K &key, V &val);
-  bool itemIsValid(fast_cache::CacheItem<K, V> &item);
+  bool getIndex(const K &key, CacheIndex &index);
+  bool itemIsValid(CacheItem<K, V> &item);
   // 删除数据
   bool del(const K &key);
 
@@ -47,7 +57,30 @@ private:
   // todo
   // 这里应该采用一个数据容器，比如std::array<uint8_t>。后续应该替换为一个循环队列。
   std::vector<uint8_t> data_;
+  // 容量
   int64_t capacity_;
+
+  // 数据淘汰策略
+  DataEvitePolicy evite_policy_;
+  // 支持LRU
+  std::list<std::pair<K, CacheIndex>> lru_list_;
+  // todo 支持LFU
+
+  // todo 支持数据清理/延迟删除
+
+  // 统计数据空间的占比，当大于一定比例时出发数据清理逻辑
+  bool need_evite_;
+  // 数据剩余空间,实际占用除以容量
+  int64_t data_used_size_;
+  // 无用数据(数据过期or删除)占用空间的比例，当大于一定比例时触发数据清理逻辑
+  int64_t data_invalid_size_;
+  // 无效数据的比例阈值
+  float data_invalid_rate_threahold_;
+  // 数据定时整理的时间间隔
+  int64_t data_evite_interval_;
+  // todo 支持数据持久化
+
+  // todo 支持数据压缩
 };
 
 template <typename K, typename V>
@@ -78,23 +111,38 @@ inline bool CacheShard<K, V>::set(CacheItem<K, V> &item) {
   // 写成功后再更新索引indexs_
   CacheIndex index;
   index.start = data_.size();
-  index.length = item_data.size();;
+  index.length = item_data.size();
   // 先写data_
-  writeIntoData(item_data);
-  // 再记录索引
-  indexs_[item.key] = std::move(index);
+  (item_data);
+  updateIndex(item, index);
   return true;
+}
+writeIntoData
+template <typename K, typename V>
+inline void CacheShard<K, V>::updateIndex(CacheItem<K, V> &item,
+                                          CacheIndex &index) {
+  // 记录索引
+  updateEvitInfo(item.key, index);
+  indexs_[item.key] = std::move(index);
+}
+
+template <typename K, typename V>
+inline void CacheShard<K, V>::updateEvitInfo(K &key, CacheIndex &index) {
+  if (evite_policy_ == LRU) {
+    lru_list_.push_front(std::make_pair(key, index));
+  } else if (evite_policy_ == LFU) {
+    // todo lfu
+  } else {
+    // todo 随机
+  }
 }
 
 template <typename K, typename V>
 inline bool CacheShard<K, V>::get(const K &key, V &val) {
-  //  先获取索引数据
-  auto iter = indexs_.find(key);
-  if (iter == indexs_.end()) {
-    spdlog::error("key:{} is not found", key);
+  CacheIndex index;
+  bool suc = getIndex(key, index);
+  if (!suc)
     return false;
-  }
-  auto &index = iter->second;
   //  然后再根据索引读取序列化的数据
   std::vector<uint8_t> data;
   data.reserve(index.length);
@@ -106,13 +154,15 @@ inline bool CacheShard<K, V>::get(const K &key, V &val) {
   //              index.start, index.length);
   //  接着对数据进行反序列化
   CacheItem<K, V> item;
-  bool suc = deserialize(data, item);
+  suc = deserialize(data, item);
   if (!suc) {
     spdlog::error("deserialize key:{} failed", key);
     return false;
   }
   if (!itemIsValid(item)) {
     spdlog::error("item is expired");
+    // 更新无用数据的大小
+    data_invalid_size_ += index.length;
     return false;
   }
   val = item.val;
@@ -120,16 +170,32 @@ inline bool CacheShard<K, V>::get(const K &key, V &val) {
   return true;
 }
 template <typename K, typename V>
-inline bool CacheShard<K, V>::itemIsValid(fast_cache::CacheItem<K, V> &item) {
+inline bool CacheShard<K, V>::getIndex(const K &key, CacheIndex &index) {
+  //  先获取索引数据
+  auto iter = indexs_.find(key);
+  if (iter == indexs_.end()) {
+    spdlog::error("key:{} is not found", key);
+    return false;
+  }
+  index = iter->second;
+  updateEvitInfo(key, index);
+  return true;
+}
+template <typename K, typename V>
+inline bool CacheShard<K, V>::itemIsValid(CacheItem<K, V> &item) {
   return item.expire_time == dataNoExpire || item.expire_time > time(NULL);
 }
 template <typename K, typename V>
 inline bool CacheShard<K, V>::del(const K &key) {
   // 从索引数据删除,1表示删除成功，0表示key不存在
-  if (indexs_.erase(key) == 0) {
+  auto iter = indexs_.find(key);
+  if (iter == indexs_.end()) {
     spdlog::error("key:{} is not found", key);
     return false;
   }
+  auto &index = iter->second;
+  indexs_.erase(iter);
+  data_invalid_size_ += index.length;
   // 异常的数据 后台定时任务进行处理删除合并，清理空间
   return true;
 }

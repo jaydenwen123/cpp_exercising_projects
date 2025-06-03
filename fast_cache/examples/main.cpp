@@ -4,6 +4,7 @@
 #include <spdlog/spdlog.h>
 #include <string>
 #include <thread>
+#include "logger.h"
 
 // 测试用例1：基本set/get功能
 void test_basic_operations(fast_cache::CacheShard<std::string, std::string> &cache) {
@@ -73,6 +74,7 @@ void test_capacity(fast_cache::CacheShard<std::string, std::string> &cache) {
 }
 
 int main() {
+  fast_cache::initLogger();
   spdlog::set_level(spdlog::level::debug);
 
   // 初始化缓存（100MB容量）

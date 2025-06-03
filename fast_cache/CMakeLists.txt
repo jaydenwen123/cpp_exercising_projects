@@ -44,6 +44,8 @@ target_sources(fast_cache INTERFACE
   ${CMAKE_CURRENT_SOURCE_DIR}/src/cache_item.h
   ${CMAKE_CURRENT_SOURCE_DIR}/src/cache_shard.h
   ${CMAKE_CURRENT_SOURCE_DIR}/src/serializer.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/logger.h
+
 )
 
 
@@ -55,13 +57,13 @@ target_link_libraries(fast_cache
 )
 
 
-
 # 在文件末尾添加测试目标配置
 enable_testing()
 
 # 添加可执行文件（示例）
 add_executable(fast_cache_example
   examples/main.cpp
+  src/logger.cpp
 )
 
 add_executable(cache_shard_test
@@ -70,6 +72,7 @@ add_executable(cache_shard_test
 
 add_executable(fast_cache_benchmark
   benchmark/fast_cache_benchmark.cpp
+  src/logger.cpp
 )
 
 target_compile_definitions(fast_cache_example
