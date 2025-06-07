@@ -1,10 +1,10 @@
 #include "cache_shard.h"
+#include "logger.h"
 #include "spdlog/sinks/basic_file_sink.h"
 #include <iostream>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
-#include "logger.h"
 namespace fast_cache {
 
 static const int kShardNum = 256;
@@ -73,7 +73,7 @@ inline bool FastCache<K, V>::set(const K &key, const V &val,
 template <typename K, typename V>
 inline bool FastCache<K, V>::get(const K &key, V &val) {
   int shard_index = get_shard_index(key);
-  std::shared_lock<std::shared_mutex> lock(*_shard_mutexs[shard_index]);
+  std::unique_lock<std::shared_mutex> lock(*_shard_mutexs[shard_index]);
   return _cache_shards[shard_index]->get(key, val);
 }
 

@@ -44,7 +44,13 @@ public:
   bool set(CacheItem<K, V> &item);
   void updateIndex(CacheItem<K, V> &item, IndexEntry<K> &index_entry);
   void updateEvitInfo(const K &key, IndexEntry<K> &index_entry,
-                      DataOpType op_type = SET);
+                      DataOpType op_type = SET, bool exist = true);
+  void evitItemWithLRUStrategy(const K &key, IndexEntry<K> &index_entry,
+                               DataOpType op_type, bool exist);
+  void evitItemWithLFUStrategy(const K &key, IndexEntry<K> &index_entry,
+                               DataOpType op_type, bool exist);
+  void evitItemWithRandomStrategy(const K &key, IndexEntry<K> &index_entry,
+                                  DataOpType op_type, bool exist);
   // 获取数据
   bool get(const K &key, V &val);
   bool getIndex(const K &key, IndexEntry<K> &index_entry);
@@ -138,29 +144,63 @@ inline bool CacheShard<K, V>::set(CacheItem<K, V> &item) {
 template <typename K, typename V>
 inline void CacheShard<K, V>::updateIndex(CacheItem<K, V> &item,
                                           IndexEntry<K> &index_entry) {
+
+  bool exist = false;
+  auto iter = indexs_.find(item.key);
+  if (iter != indexs_.end()) {
+    auto &old_index = iter->second;
+    index_entry.lru_iter = old_index.lru_iter;
+    exist = true;
+  }
   // 记录索引
-  updateEvitInfo(item.key, index_entry, SET);
+  updateEvitInfo(item.key, index_entry, SET, exist);
   indexs_[item.key] = std::move(index_entry);
 }
 
 template <typename K, typename V>
 inline void CacheShard<K, V>::updateEvitInfo(const K &key,
                                              IndexEntry<K> &index_entry,
-                                             DataOpType op_type) {
+                                             DataOpType op_type, bool exist) {
   if (evite_policy_ == LRU) {
-    // 存在的话先删除，然后再移动到头部
-    if (indexs_.count(key) > 0 && index_entry.lru_iter != lru_list_.end()) {
-      lru_list_.erase(index_entry.lru_iter);
-    }
-    if (op_type != DEL) {
-      lru_list_.push_front(std::make_pair(key, index_entry.index));
-      index_entry.lru_iter = lru_list_.begin();
-    }
+    evitItemWithLRUStrategy(key, index_entry, op_type, exist);
   } else if (evite_policy_ == LFU) {
     // todo lfu
+    evitItemWithLFUStrategy(key, index_entry, op_type, exist);
   } else {
     // todo 随机
+    evitItemWithRandomStrategy(key, index_entry, op_type, exist);
   }
+}
+template <typename K, typename V>
+inline void CacheShard<K, V>::evitItemWithLRUStrategy(
+    const K &key, IndexEntry<K> &index_entry, DataOpType op_type, bool exist) {
+  if (op_type == DEL && exist) {
+    lru_list_.erase(index_entry.lru_iter);
+  } else if (op_type == GET && exist) {
+    lru_list_.splice(lru_list_.begin(), lru_list_, index_entry.lru_iter);
+    index_entry.lru_iter = lru_list_.begin();
+  } else {
+    // SET
+    // 存在的话先移除
+    if (exist) {
+      lru_list_.erase(index_entry.lru_iter);
+    }
+    lru_list_.push_front(std::make_pair(key, index_entry.index));
+    index_entry.lru_iter = lru_list_.begin();
+  }
+}
+
+template <typename K, typename V>
+inline void CacheShard<K, V>::evitItemWithLFUStrategy(
+    const K &key, IndexEntry<K> &index_entry, DataOpType op_type, bool exist) {
+
+  // todo...
+}
+
+template <typename K, typename V>
+inline void CacheShard<K, V>::evitItemWithRandomStrategy(
+    const K &key, IndexEntry<K> &index_entry, DataOpType op_type, bool exist) {
+  // todo...
 }
 
 template <typename K, typename V>
