@@ -6,6 +6,7 @@
 #include <iterator>
 #include <list>
 #include <map>
+#include <random>
 #include <spdlog/spdlog.h>
 #include <unordered_map>
 #include <utility>
@@ -51,12 +52,13 @@ public:
   void updateIndex(CacheItem<K, V> &item, IndexEntry<K> &index_entry);
   void updateEvitInfo(const K &key, IndexEntry<K> &index_entry,
                       DataOpType op_type = SET, bool exist = true);
-  void evitItemWithLRUStrategy(const K &key, IndexEntry<K> &index_entry,
-                               DataOpType op_type, bool exist);
-  void evitItemWithLFUStrategy(const K &key, IndexEntry<K> &index_entry,
-                               DataOpType op_type, bool exist);
-  void evitItemWithRandomStrategy(const K &key, IndexEntry<K> &index_entry,
-                                  DataOpType op_type, bool exist);
+  void updateEvitInfoWithLRUStrategy(const K &key, IndexEntry<K> &index_entry,
+                                     DataOpType op_type, bool exist);
+  void updateEvitInfoWithLFUStrategy(const K &key, IndexEntry<K> &index_entry,
+                                     DataOpType op_type, bool exist);
+  void updateEvitInfoWithRandomStrategy(const K &key,
+                                        IndexEntry<K> &index_entry,
+                                        DataOpType op_type, bool exist);
   // 获取数据
   bool get(const K &key, V &val);
   bool getIndex(const K &key, IndexEntry<K> &index_entry);
@@ -69,6 +71,7 @@ public:
   void clear();
 
 private:
+  bool eviteItem(std::vector<uint8_t> &item_data);
   //  后台定时任务，自动获取时间戳
   int64_t getSystemCurrentTs();
   // 写入data_
@@ -135,17 +138,74 @@ inline bool CacheShard<K, V>::set(const K &key, const V &val,
 }
 
 template <typename K, typename V>
+inline bool CacheShard<K, V>::eviteItem(std::vector<uint8_t> &item_data) {
+  // 数据淘汰，然后再插入
+  //  - LRU、LFU
+  int64_t need_space_size = data_.size() + item_data.size() - capacity_;
+  if (evite_policy_ == LRU) {
+    // 如何淘汰呢？
+    // 从lru的末尾移除一个元素(索引)
+    while (need_space_size > 0) {
+      auto &back = lru_list_.back();
+      auto &key = back.first;
+      auto &index = back.second;
+      // 直接删除
+      indexs_.erase(key);
+      lru_list_.pop_back();
+      need_space_size -= index.length;
+    }
+  } else if (evite_policy_ == LFU) {
+    while (need_space_size > 0 && !lfu_map_.empty() && !indexs_.empty()) {
+      auto min_iter = lfu_map_.begin();
+      auto range_iter = lfu_map_.equal_range(min_iter->first);
+      for (auto iter = range_iter.first;
+           iter != range_iter.second && need_space_size > 0;) {
+        auto &key = iter->second;
+        auto &index_entry = indexs_[key];
+        auto current_it = iter;
+        iter++;
+        indexs_.erase(key);
+        lfu_map_.erase(current_it);
+        need_space_size -= index_entry.index.length;
+      }
+    }
+  } else if (evite_policy_ == RANDOM) {
+    // 随机淘汰
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    // 随机淘汰
+    while (need_space_size > 0 && !indexs_.empty()) {
+      int size = indexs_.size();
+      std::uniform_real_distribution<> dis(0, size - 1);
+      int get_random_index = dis(gen);
+      auto iter = indexs_.begin();
+      // 移动到随机为止
+      std::advance(iter, get_random_index);
+      // 下面方式会编译报错
+      // iter += get_random_index;
+      auto &key = iter->first;
+      auto &index_entry = iter->second;
+      indexs_.erase(key);
+      need_space_size -= index_entry.index.length;
+    }
+  } else {
+    return false;
+  }
+  return true;
+}
+
+template <typename K, typename V>
 inline bool CacheShard<K, V>::set(CacheItem<K, V> &item) {
   // 对item进行序列化
   std::vector<uint8_t> item_data;
   serialize(item, item_data);
   // 如果数据超过了size_，应该如何处理？
   if (data_.size() + item_data.size() > capacity_) {
-    // 没法存储了，先返回
-    // todo 后续可以进行 数据淘汰，然后再插入
-    //  - LRU、LFU
-    spdlog::error("data is full");
-    return false;
+    bool suc = eviteItem(item_data);
+    if (!suc) {
+      spdlog::error("eviteItem failed");
+      return false;
+    }
   }
   // 必须先保存，因为下面会把item_data的数据移动到data_中，所以直接取size()会是0
   // 写成功后再更新索引indexs_
@@ -187,17 +247,17 @@ inline void CacheShard<K, V>::updateEvitInfo(const K &key,
                                              IndexEntry<K> &index_entry,
                                              DataOpType op_type, bool exist) {
   if (evite_policy_ == LRU) {
-    evitItemWithLRUStrategy(key, index_entry, op_type, exist);
+    updateEvitInfoWithLRUStrategy(key, index_entry, op_type, exist);
   } else if (evite_policy_ == LFU) {
     // lfu
-    evitItemWithLFUStrategy(key, index_entry, op_type, exist);
+    updateEvitInfoWithLFUStrategy(key, index_entry, op_type, exist);
   } else {
     // 随机
-    evitItemWithRandomStrategy(key, index_entry, op_type, exist);
+    updateEvitInfoWithRandomStrategy(key, index_entry, op_type, exist);
   }
 }
 template <typename K, typename V>
-inline void CacheShard<K, V>::evitItemWithLRUStrategy(
+inline void CacheShard<K, V>::updateEvitInfoWithLRUStrategy(
     const K &key, IndexEntry<K> &index_entry, DataOpType op_type, bool exist) {
   if (op_type == DEL && exist) {
     lru_list_.erase(index_entry.lru_iter);
@@ -216,7 +276,7 @@ inline void CacheShard<K, V>::evitItemWithLRUStrategy(
 }
 
 template <typename K, typename V>
-inline void CacheShard<K, V>::evitItemWithLFUStrategy(
+inline void CacheShard<K, V>::updateEvitInfoWithLFUStrategy(
     const K &key, IndexEntry<K> &index_entry, DataOpType op_type, bool exist) {
   int64_t current_ts = getSystemCurrentTs();
   // 实现LFU逻辑
@@ -283,7 +343,7 @@ inline void CacheShard<K, V>::evitItemWithLFUStrategy(
 }
 
 template <typename K, typename V>
-inline void CacheShard<K, V>::evitItemWithRandomStrategy(
+inline void CacheShard<K, V>::updateEvitInfoWithRandomStrategy(
     const K &key, IndexEntry<K> &index_entry, DataOpType op_type, bool exist) {
   // 实现随机数逻辑
   // 随机策略下，数据读写的时候不需要更新，只有在淘汰时才需要处理
