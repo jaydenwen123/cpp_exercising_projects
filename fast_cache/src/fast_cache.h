@@ -19,7 +19,7 @@ public:
   FastCache(const int shard_num = defaultShardNum,
             const int64_t capacity_size = defaultCapacitySize,
             const DataEvitePolicy evite_policy = LRU);
-  ~FastCache() ;
+  ~FastCache();
 
   bool set(const K &key, const V &val);
   int get_shard_index(const K &key);
@@ -31,7 +31,7 @@ public:
 
 private:
   std::vector<std::unique_ptr<CacheShard<K, V>>> _cache_shards;
-  std::vector<std::unique_ptr<std::shared_mutex>> _shard_mutexs;
+  // std::vector<> _shard_mutexs;
   int _shard_num;
 
   // 更新系统时间戳的异步线程

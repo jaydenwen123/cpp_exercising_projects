@@ -6,6 +6,7 @@
 #include <iterator>
 #include <list>
 #include <map>
+#include <mutex>
 #include <random>
 #include <spdlog/spdlog.h>
 #include <unordered_map>
@@ -41,14 +42,56 @@ public:
              const DataEvitePolicy evite_policy = LRU)
       : parent_(parent), evite_policy_(evite_policy) {
     init(capacity);
+    // 开始启动异步任务
+    /* data_merger_thread_ = std::thread(
+        [this]() {
+          while (!stop_flag_.load(std::memory_order_relaxed)) {
+            if (need_evite_) {
+              spdlog::info("need merge data");
+              this->backendDataMergeTasker();
+              this->need_evite_.store(false);
+            }
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(data_evite_interval_));
+            if (!need_evite_) {
+              this->need_evite_.store(true, std::memory_order_relaxed);
+            }
+          }
+        },
+        this); */
   }
-  ~CacheShard() {}
+  // 禁用拷贝构造和赋值
+  CacheShard(const CacheShard &) = delete;
+  CacheShard &operator=(const CacheShard &) = delete;
+  ~CacheShard() {
+    stop_flag_.store(true, std::memory_order_relaxed);
+    if (data_merger_thread_.joinable()) {
+      data_merger_thread_.join();
+    }
+  }
   // 初始化data_的容量
   void init(int64_t capacity);
   // 插入or 更新数据
   bool set(const K &key, const V &val);
   bool set(const K &key, const V &val, int64_t expire_time);
   bool set(CacheItem<K, V> &item);
+
+  // 获取数据
+  bool get(const K &key, V &val);
+
+  // 删除数据
+  bool del(const K &key);
+
+  int64_t size();
+  bool empty();
+  void clear();
+
+private:
+  bool getIndex(const K &key, IndexEntry<K> &index_entry);
+  bool itemIsExpired(int64_t expire_time);
+  // 后台异步任务数据合并整理
+  void backendDataMergeTasker();
+  void updateStatInfo(IndexEntry<K> &index_entry);
   void updateIndex(CacheItem<K, V> &item, IndexEntry<K> &index_entry);
   void updateEvitInfo(const K &key, IndexEntry<K> &index_entry,
                       DataOpType op_type = SET, bool exist = true);
@@ -59,20 +102,9 @@ public:
   void updateEvitInfoWithRandomStrategy(const K &key,
                                         IndexEntry<K> &index_entry,
                                         DataOpType op_type, bool exist);
-  // 获取数据
-  bool get(const K &key, V &val);
-  bool getIndex(const K &key, IndexEntry<K> &index_entry);
-  bool itemIsExpired(int64_t expire_time);
-  // 删除数据
-  bool del(const K &key);
 
-  int64_t size();
-  bool empty();
-  void clear();
-
-private:
   bool eviteItem(std::vector<uint8_t> &item_data);
-  //  后台定时任务，自动获取时间戳
+  // 自动获取时间戳
   int64_t getSystemCurrentTs();
   // 写入data_
   bool writeIntoData(std::vector<uint8_t> &data);
@@ -100,13 +132,12 @@ private:
   std::multimap<std::pair<int64_t, int64_t>, K, LFUComparer> lfu_map_;
 
   // todo 支持数据清理/延迟删除
-
   // 统计数据空间的占比，当大于一定比例时出发数据清理逻辑
-  bool need_evite_;
+  std::atomic<bool> need_evite_;
   // 数据剩余空间,实际占用除以容量
   int64_t data_used_size_;
   // 无用数据(数据过期or删除)占用空间的比例，当大于一定比例时触发数据清理逻辑
-  int64_t data_invalid_size_;
+  std::atomic<int64_t> data_invalid_size_;
   // 无效数据的比例阈值
   float data_evite_invalid_rate_threahold_;
   // 数据定时整理的时间间隔
@@ -116,12 +147,31 @@ private:
   // todo 支持数据压缩
 
   FastCache<K, V> *parent_;
+  std::shared_mutex shard_mutex_;
+  std::thread data_merger_thread_;
+  std::atomic<bool> stop_flag_{false};
 };
+
+template <typename K, typename V>
+inline void CacheShard<K, V>::updateStatInfo(IndexEntry<K> &index_entry) {
+  data_invalid_size_.fetch_add(index_entry.index.length,
+                               std::memory_order_relaxed);
+  if (data_invalid_size_.load(std::memory_order_relaxed) >
+      capacity_ * data_evite_invalid_rate_threahold_) {
+    need_evite_.store(true, std::memory_order_relaxed);
+  }
+}
 
 template <typename K, typename V>
 inline void CacheShard<K, V>::init(int64_t capacity) {
   data_.reserve(capacity);
   capacity_ = capacity;
+  data_used_size_ = 0;
+  data_invalid_size_ = 0;
+  // todo移动到配置文件中
+  data_evite_invalid_rate_threahold_ = 0.5;
+  data_evite_interval_ = 1000;
+  need_evite_ = false;
 }
 
 template <typename K, typename V>
@@ -135,6 +185,36 @@ inline bool CacheShard<K, V>::set(const K &key, const V &val,
                                   int64_t expire_time) {
   CacheItem<K, V> item(key, val, expire_time);
   return set(item);
+}
+
+template <typename K, typename V>
+inline bool CacheShard<K, V>::set(CacheItem<K, V> &item) {
+  std::unique_lock<std::shared_mutex> lock(shard_mutex_);
+  // 对item进行序列化
+  std::vector<uint8_t> item_data;
+  serialize(item, item_data);
+  // 如果数据超过了size_，应该如何处理？
+  if (data_.size() + item_data.size() > capacity_) {
+    bool suc = eviteItem(item_data);
+    if (!suc) {
+      spdlog::error("eviteItem failed");
+      return false;
+    }
+  }
+  // 必须先保存，因为下面会把item_data的数据移动到data_中，所以直接取size()会是0
+  // 写成功后再更新索引indexs_
+  IndexEntry<K> index_entry;
+  index_entry.index.start = data_.size();
+  index_entry.index.length = item_data.size();
+  index_entry.index.expire_time = item.expire_time;
+
+  // 先写data_
+  if (!writeIntoData(item_data)) {
+    spdlog::error("writeIntoData failed");
+    return false;
+  }
+  updateIndex(item, index_entry);
+  return true;
 }
 
 template <typename K, typename V>
@@ -191,35 +271,6 @@ inline bool CacheShard<K, V>::eviteItem(std::vector<uint8_t> &item_data) {
   } else {
     return false;
   }
-  return true;
-}
-
-template <typename K, typename V>
-inline bool CacheShard<K, V>::set(CacheItem<K, V> &item) {
-  // 对item进行序列化
-  std::vector<uint8_t> item_data;
-  serialize(item, item_data);
-  // 如果数据超过了size_，应该如何处理？
-  if (data_.size() + item_data.size() > capacity_) {
-    bool suc = eviteItem(item_data);
-    if (!suc) {
-      spdlog::error("eviteItem failed");
-      return false;
-    }
-  }
-  // 必须先保存，因为下面会把item_data的数据移动到data_中，所以直接取size()会是0
-  // 写成功后再更新索引indexs_
-  IndexEntry<K> index_entry;
-  index_entry.index.start = data_.size();
-  index_entry.index.length = item_data.size();
-  index_entry.index.expire_time = item.expire_time;
-
-  // 先写data_
-  if (!writeIntoData(item_data)) {
-    spdlog::error("writeIntoData failed");
-    return false;
-  }
-  updateIndex(item, index_entry);
   return true;
 }
 
@@ -351,6 +402,7 @@ inline void CacheShard<K, V>::updateEvitInfoWithRandomStrategy(
 
 template <typename K, typename V>
 inline bool CacheShard<K, V>::get(const K &key, V &val) {
+  std::unique_lock<std::shared_mutex> lock(shard_mutex_);
   IndexEntry<K> index_entry;
   bool suc = getIndex(key, index_entry);
   if (!suc)
@@ -359,7 +411,7 @@ inline bool CacheShard<K, V>::get(const K &key, V &val) {
   if (itemIsExpired(index.expire_time)) {
     spdlog::error("item is expired");
     // 更新无用数据的大小
-    data_invalid_size_ += index.length;
+    updateStatInfo(index_entry);
     return false;
   }
   //  然后再根据索引读取序列化的数据
@@ -381,14 +433,14 @@ inline bool CacheShard<K, V>::get(const K &key, V &val) {
 
   if (item.expire_time != index.expire_time) {
     spdlog::error("item expire_time is not equal");
-    data_invalid_size_ += index.length;
+    updateStatInfo(index_entry);
     return false;
   }
 
   if (itemIsExpired(item.expire_time)) {
     spdlog::error("item is expired");
     // 更新无用数据的大小
-    data_invalid_size_ += index.length;
+    updateStatInfo(index_entry);
     return false;
   }
 
@@ -415,28 +467,81 @@ inline bool CacheShard<K, V>::itemIsExpired(int64_t expire_time) {
 }
 template <typename K, typename V>
 inline bool CacheShard<K, V>::del(const K &key) {
+  std::unique_lock<std::shared_mutex> lock(shard_mutex_);
   auto iter = indexs_.find(key);
   if (iter == indexs_.end()) {
     spdlog::error("key:{} is not found", key);
     return false;
   }
-  auto &entry_index = iter->second;
+  auto &index_entry = iter->second;
   indexs_.erase(iter);
-  updateEvitInfo(key, entry_index, DEL);
-  data_invalid_size_ += entry_index.index.length;
+  updateEvitInfo(key, index_entry, DEL);
+  updateStatInfo(index_entry);
   // 异常的数据 后台定时任务进行处理删除合并，清理空间
   return true;
 }
 
 template <typename K, typename V> inline bool CacheShard<K, V>::empty() {
+  std::shared_lock<std::shared_mutex> lock(shard_mutex_);
   return indexs_.empty();
 }
 
+template <typename K, typename V>
+inline void CacheShard<K, V>::backendDataMergeTasker() {
+  // 后台异步数据清理任务
+  // 主要的思路如下：
+  // 1. 方式1
+  // 遍历索引数据，然后根据索引读取数据，再重新写入到一个新的数据buffer(new_data_)和索引中，最后将data_，indexs_进行替换
+  // 方式1中，如果无效数据很多的话，效率会比较高。因为索引的数据比较小
+  // 2. 方式2
+  // 直接读取data_中的数据，然后解析每个item数据，然后再重新写入到一个新的数据buffer(new_data_)中，最后将data_进行替换，并将索引同步更新
+  // 方式2中，如果无效数据很多的话，效率会比较低，因为它需要每个item的数据都进行反序列化，然后才能判断
+  // 但方式2不需要遍历索引数据，因此不需要加锁
+
+  std::unordered_map<K, IndexEntry<K>> new_indexs_;
+  std::vector<uint8_t> new_data_;
+  new_indexs_.reserve(indexs_.size());
+  new_data_.reserve(capacity_);
+  int new_data_used_size;
+  // 下文采用方式1来进行实现
+  for (auto &iter : indexs_) {
+    auto &key = iter.first;
+    auto &index_entry = iter.second;
+    if (itemIsExpired(index_entry.index.expire_time)) {
+      // 无效数据，直接删除
+      // updateStatInfo(index_entry);
+      indexs_.erase(key);
+      continue;
+    }
+    // 有效数据
+    auto new_index_entry = index_entry;
+    new_index_entry.index.start = new_data_.size();
+    // 写入数据
+    auto start = data_.begin() + index_entry.index.start;
+    auto end = start + index_entry.index.length;
+    new_data_used_size += index_entry.index.length;
+    new_data_.insert(new_data_.end(), start, end);
+    // 更新索引
+    new_indexs_[key] = new_index_entry;
+  }
+  // 最后进行替换
+  {
+    std::unique_lock<std::shared_mutex> lock(shard_mutex_);
+    indexs_.swap(new_indexs_);
+    data_.swap(new_data_);
+    data_used_size_ = new_data_used_size;
+    data_invalid_size_.store(0, std::memory_order_relaxed);
+    need_evite_.store(false, std::memory_order_relaxed);
+  }
+}
+
 template <typename K, typename V> inline int64_t CacheShard<K, V>::size() {
+  std::shared_lock<std::shared_mutex> lock(shard_mutex_);
   return indexs_.size();
 }
 
 template <typename K, typename V> inline void CacheShard<K, V>::clear() {
+  std::unique_lock<std::shared_mutex> lock(shard_mutex_);
   indexs_.clear();
   data_.clear();
 }
