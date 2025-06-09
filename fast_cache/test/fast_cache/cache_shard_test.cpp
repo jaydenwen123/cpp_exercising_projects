@@ -16,7 +16,7 @@ protected:
 
 // 测试 CacheShard 的构造函数
 TEST_F(CacheShardTest, Constructor) {
-  fast_cache::CacheShard<std::string, std::string> cache(100 * 1024 * 1024);
+  fast_cache::CacheShard<std::string, std::string> cache(100 * 1024 * 1024,nullptr,fast_cache::LFU);
   // 验证构造后的初始状态
   EXPECT_EQ(cache.size(), 0);
   EXPECT_TRUE(cache.empty());
@@ -24,7 +24,7 @@ TEST_F(CacheShardTest, Constructor) {
 
 // 测试插入和查找功能
 TEST_F(CacheShardTest, SetAndGet) {
-  fast_cache::CacheShard<std::string, std::string> cache(100 * 1024 * 1024);
+  fast_cache::CacheShard<std::string, std::string> cache(100 * 1024 * 1024,nullptr,fast_cache::LFU);
   std::string key = "test_key";
   std::string value = "test_value";
 
@@ -40,7 +40,7 @@ TEST_F(CacheShardTest, SetAndGet) {
 
 // 测试删除功能
 TEST_F(CacheShardTest, SetAndDel) {
-  fast_cache::CacheShard<std::string, std::string> cache(100 * 1024 * 1024);
+  fast_cache::CacheShard<std::string, std::string> cache(100 * 1024 * 1024,nullptr,fast_cache::LFU);
   std::string key = "test_key";
   std::string value = "test_value";
 
@@ -56,7 +56,7 @@ TEST_F(CacheShardTest, SetAndDel) {
 
 // 测试大小和空状态
 TEST_F(CacheShardTest, SizeAndEmpty) {
-  fast_cache::CacheShard<std::string, std::string> cache(100 * 1024 * 1024);
+  fast_cache::CacheShard<std::string, std::string> cache(100 * 1024 * 1024,nullptr,fast_cache::LFU);
   EXPECT_TRUE(cache.empty());
 
   cache.set("key1", "value1");
@@ -69,7 +69,7 @@ TEST_F(CacheShardTest, SizeAndEmpty) {
 
 // 测试清除所有内容
 TEST_F(CacheShardTest, Clear) {
-  fast_cache::CacheShard<std::string, std::string> cache(100 * 1024 * 1024);
+  fast_cache::CacheShard<std::string, std::string> cache(100 * 1024 * 1024,nullptr,fast_cache::LFU);
   cache.set("key1", "value1");
   cache.set("key2", "value2");
 

@@ -1,13 +1,15 @@
 #include "cache_shard.h"
+#include "evite_policy.h"
+#include "logger.h"
 #include <chrono>
 #include <iostream>
 #include <spdlog/spdlog.h>
 #include <string>
 #include <thread>
-#include "logger.h"
 
 // 测试用例1：基本set/get功能
-void test_basic_operations(fast_cache::CacheShard<std::string, std::string> &cache) {
+void test_basic_operations(
+    fast_cache::CacheShard<std::string, std::string> &cache) {
   spdlog::info("=== 开始基础功能测试 ===");
 
   // 测试正常插入和查询
@@ -78,8 +80,11 @@ int main() {
   spdlog::set_level(spdlog::level::debug);
 
   // 初始化缓存（100MB容量）
-  fast_cache::CacheShard<std::string, std::string> cache(100 * 1024 * 1024);
+  fast_cache::CacheShard<std::string, std::string> cache(100 * 1024 * 1024,nullptr,fast_cache::LFU);
 
+  spdlog::info("IndexEntry size:{},ItemIndex size:{}",
+               sizeof(fast_cache::IndexEntry<std::string>),
+               sizeof(fast_cache::ItemIndex));
   // 执行测试用例
   test_basic_operations(cache);
   test_delete_operation(cache);

@@ -1,9 +1,14 @@
+#pragma once
 #include "cache_item.h"
+#include "evite_policy.h"
+#include "fast_cache.h"
 #include "serializer.h"
 #include <iterator>
 #include <list>
+#include <map>
 #include <spdlog/spdlog.h>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <zlib.h>
 namespace fast_cache {
@@ -24,20 +29,21 @@ struct ItemIndex {
 template <typename K> struct IndexEntry {
   ItemIndex index;
   typename std::list<std::pair<K, ItemIndex>>::iterator lru_iter = {};
+  // std::pair<int64_t,int64_t>中，第一个是访问次数，第二个访问时间戳
+  std::pair<int64_t, int64_t> lfu_count = {};
 };
 
-enum DataEvitePolicy {
-  LRU,
-  LFU,
-  RANDOM
-  // todo ...
-};
+// 分片shard，现成不安全
 template <typename K, typename V> class CacheShard {
 public:
-  CacheShard(int64_t size) { init(size); }
+  CacheShard(const int64_t capacity, FastCache<K, V> *parent = nullptr,
+             const DataEvitePolicy evite_policy = LRU)
+      : parent_(parent), evite_policy_(evite_policy) {
+    init(capacity);
+  }
   ~CacheShard() {}
   // 初始化data_的容量
-  void init(int64_t size);
+  void init(int64_t capacity);
   // 插入or 更新数据
   bool set(const K &key, const V &val);
   bool set(const K &key, const V &val, int64_t expire_time);
@@ -63,6 +69,8 @@ public:
   void clear();
 
 private:
+  //  后台定时任务，自动获取时间戳
+  int64_t getSystemCurrentTs();
   // 写入data_
   bool writeIntoData(std::vector<uint8_t> &data);
   // 序列化
@@ -81,9 +89,12 @@ private:
 
   // 数据淘汰策略
   DataEvitePolicy evite_policy_;
-  // 支持LRU
+  // 支持LRU--数据的读写时更新lru_list_
   std::list<std::pair<K, ItemIndex>> lru_list_;
-  // todo 支持LFU
+  // std::unordered_map<K, std::pair<int64_t, int64_t>> lfu_count_map_;
+  // 支持LFU--数据读写时更新访问频率,支持有序
+  // 按照访问频率进行排序
+  std::multimap<std::pair<int64_t, int64_t>, K, LFUComparer> lfu_map_;
 
   // todo 支持数据清理/延迟删除
 
@@ -100,6 +111,8 @@ private:
   // todo 支持数据持久化
 
   // todo 支持数据压缩
+
+  FastCache<K, V> *parent_;
 };
 
 template <typename K, typename V>
@@ -126,12 +139,21 @@ inline bool CacheShard<K, V>::set(CacheItem<K, V> &item) {
   // 对item进行序列化
   std::vector<uint8_t> item_data;
   serialize(item, item_data);
+  // 如果数据超过了size_，应该如何处理？
+  if (data_.size() + item_data.size() > capacity_) {
+    // 没法存储了，先返回
+    // todo 后续可以进行 数据淘汰，然后再插入
+    //  - LRU、LFU
+    spdlog::error("data is full");
+    return false;
+  }
   // 必须先保存，因为下面会把item_data的数据移动到data_中，所以直接取size()会是0
   // 写成功后再更新索引indexs_
   IndexEntry<K> index_entry;
   index_entry.index.start = data_.size();
   index_entry.index.length = item_data.size();
   index_entry.index.expire_time = item.expire_time;
+
   // 先写data_
   if (!writeIntoData(item_data)) {
     spdlog::error("writeIntoData failed");
@@ -148,8 +170,11 @@ inline void CacheShard<K, V>::updateIndex(CacheItem<K, V> &item,
   bool exist = false;
   auto iter = indexs_.find(item.key);
   if (iter != indexs_.end()) {
-    auto &old_index = iter->second;
-    index_entry.lru_iter = old_index.lru_iter;
+    auto &old_index_entry = iter->second;
+    auto latest_index = index_entry.index;
+    // 这里通过 旧的index_entry赋值给新的index_entry，然后再更更新最新的index
+    index_entry = old_index_entry;
+    index_entry.index = latest_index;
     exist = true;
   }
   // 记录索引
@@ -164,10 +189,10 @@ inline void CacheShard<K, V>::updateEvitInfo(const K &key,
   if (evite_policy_ == LRU) {
     evitItemWithLRUStrategy(key, index_entry, op_type, exist);
   } else if (evite_policy_ == LFU) {
-    // todo lfu
+    // lfu
     evitItemWithLFUStrategy(key, index_entry, op_type, exist);
   } else {
-    // todo 随机
+    // 随机
     evitItemWithRandomStrategy(key, index_entry, op_type, exist);
   }
 }
@@ -193,14 +218,75 @@ inline void CacheShard<K, V>::evitItemWithLRUStrategy(
 template <typename K, typename V>
 inline void CacheShard<K, V>::evitItemWithLFUStrategy(
     const K &key, IndexEntry<K> &index_entry, DataOpType op_type, bool exist) {
-
-  // todo...
+  int64_t current_ts = getSystemCurrentTs();
+  // 实现LFU逻辑
+  if (op_type == DEL && exist) {
+    // 执行删除操作
+    auto lfu_count = index_entry.lfu_count;
+    auto range_iter = lfu_map_.equal_range(lfu_count);
+    bool find = false;
+    for (auto iter = range_iter.first; iter != range_iter.second; ++iter) {
+      if (iter->second == key) {
+        lfu_map_.erase(iter);
+        find = true;
+        break;
+      }
+    }
+    if (!find) {
+      spdlog::error("lfu_map_ {} not find key:{}", int(op_type), key);
+    }
+  } else if (op_type == GET && exist) {
+    auto &lfu_count = index_entry.lfu_count;
+    // 先找到，再删除
+    auto range_iter = lfu_map_.equal_range(lfu_count);
+    bool find = false;
+    for (auto iter = range_iter.first; iter != range_iter.second; ++iter) {
+      if (iter->second == key) {
+        lfu_map_.erase(iter);
+        // 只更新访问时间
+        lfu_count.second = current_ts;
+        lfu_map_.emplace(std::make_pair(lfu_count, key));
+        find = true;
+        break;
+      }
+    }
+    if (!find) {
+      spdlog::error("lfu_map_ {} not find key:{}", int(op_type), key);
+    }
+  } else {
+    // SET
+    if (exist) {
+      // 先找到，再删除，再插入
+      auto &lfu_count = index_entry.lfu_count;
+      auto iter_range = lfu_map_.equal_range(lfu_count);
+      bool find = false;
+      // 先找到，再删除
+      for (auto iter = iter_range.first; iter != iter_range.second; ++iter) {
+        if (iter->second == key) {
+          lfu_map_.erase(iter);
+          lfu_count.first++;
+          lfu_count.second = current_ts;
+          lfu_map_.emplace(std::make_pair(lfu_count, key));
+          find = true;
+          break;
+        }
+      }
+      if (!find) {
+        spdlog::error("lfu_map_ {} not find key:{}", int(op_type), key);
+      }
+    } else {
+      // 直接插入
+      index_entry.lfu_count = std::move(std::make_pair(1, current_ts));
+      lfu_map_.emplace(index_entry.lfu_count, key);
+    }
+  }
 }
 
 template <typename K, typename V>
 inline void CacheShard<K, V>::evitItemWithRandomStrategy(
     const K &key, IndexEntry<K> &index_entry, DataOpType op_type, bool exist) {
-  // todo...
+  // 实现随机数逻辑
+  // 随机策略下，数据读写的时候不需要更新，只有在淘汰时才需要处理
 }
 
 template <typename K, typename V>
@@ -265,7 +351,7 @@ inline bool CacheShard<K, V>::getIndex(const K &key,
 }
 template <typename K, typename V>
 inline bool CacheShard<K, V>::itemIsExpired(int64_t expire_time) {
-  return expire_time != dataNoExpire && expire_time < time(NULL);
+  return expire_time != dataNoExpire && expire_time < getSystemCurrentTs();
 }
 template <typename K, typename V>
 inline bool CacheShard<K, V>::del(const K &key) {
@@ -296,15 +382,17 @@ template <typename K, typename V> inline void CacheShard<K, V>::clear() {
 }
 
 template <typename K, typename V>
-inline bool CacheShard<K, V>::writeIntoData(std::vector<uint8_t> &item_data) {
-  // 如果数据超过了size_，应该如何处理？
-  if (data_.size() + item_data.size() > capacity_) {
-    // 没法存储了，先返回
-    // todo 后续可以进行 数据淘汰，然后再插入
-    //  - LRU、LFU
-    spdlog::error("data is full");
-    return false;
+inline int64_t CacheShard<K, V>::getSystemCurrentTs() {
+  if (parent_) {
+    return parent_->getCurrentTs();
   }
+  return std::chrono::duration_cast<std::chrono::seconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+template <typename K, typename V>
+inline bool CacheShard<K, V>::writeIntoData(std::vector<uint8_t> &item_data) {
   //   将item_data的数据移动到data_中
   data_.insert(data_.end(), std::make_move_iterator(item_data.begin()),
                std::make_move_iterator(item_data.end()));

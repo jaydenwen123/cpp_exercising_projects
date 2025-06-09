@@ -23,7 +23,7 @@ include(FetchContent)
 FetchContent_Declare(
   spdlog
   GIT_REPOSITORY https://github.com/gabime/spdlog.git
-  GIT_TAG v1.11.0
+  GIT_TAG v1.12.0
 )
 FetchContent_Declare(
   googletest
@@ -47,6 +47,8 @@ target_sources(fast_cache INTERFACE
   ${CMAKE_CURRENT_SOURCE_DIR}/src/cache_shard.h
   ${CMAKE_CURRENT_SOURCE_DIR}/src/serializer.h
   ${CMAKE_CURRENT_SOURCE_DIR}/src/logger.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/evite_policy.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/evite_policy.cpp
 
 )
 
